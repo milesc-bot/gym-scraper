@@ -98,3 +98,123 @@ export interface ScanResult {
   locationIds: string[];
   classesUpserted: number;
 }
+
+// ─── Fetch result ──────────────────────────────────────────
+
+/**
+ * Extended fetch result returned by the refactored stealthFetcher.
+ *
+ * WHY return the Page + BrowserContext instead of just HTML?
+ * The extraction validator (Section 6) needs to inspect live DOM state
+ * (button states, pagination indicators) *after* scraping but *before*
+ * the context is closed.  The caller is responsible for closing `context`
+ * when done.
+ */
+export interface FetchResult {
+  html: string;
+  /** The live Puppeteer Page — only available when the browser path was used. */
+  page?: import('puppeteer').Page;
+  /** The BrowserContext that owns the page.  Caller MUST close this when done. */
+  context?: import('puppeteer').BrowserContext;
+  /** HTTP status code of the primary navigation. */
+  statusCode?: number;
+  /** Which fetch path was used. */
+  fetchMethod: 'browser' | 'light';
+}
+
+// ─── Validator result ──────────────────────────────────────
+
+/** Hints the validator can return to guide the orchestrator's retry strategy. */
+export type RetryHint =
+  | 'paginate-forward'   // "Next Day" button is active, more data exists
+  | 'wait-longer'        // JS may not have finished rendering
+  | 'switch-to-browser'  // Light fetch missed JS-rendered content
+  | 're-authenticate';   // Page looks like a login wall
+
+export interface ValidatorResult {
+  valid: boolean;
+  /** 0.0 – 1.0 confidence that the extraction is correct. */
+  confidence: number;
+  /** Human-readable descriptions of each check that ran. */
+  signals: string[];
+  /** If invalid, a hint for what the orchestrator should try differently. */
+  retryHint?: RetryHint;
+}
+
+// ─── Navigation planner ────────────────────────────────────
+
+/** Structured output from the LLM-powered navigation planner. */
+export interface PlannerResult {
+  /** CSS selector for the schedule container (table, list, grid). */
+  scheduleSelector: string | null;
+  /** CSS selector for the "next day/week" navigation button. */
+  nextButtonSelector: string | null;
+  /** CSS selector for any "load more" / pagination control. */
+  loadMoreSelector: string | null;
+  /** Whether the LLM detected a login/auth wall blocking content. */
+  authWallDetected: boolean;
+}
+
+// ─── Session state ─────────────────────────────────────────
+
+export type SessionState = 'logged-in' | 'logged-out' | 'unknown';
+
+// ─── Day-worker API pattern ────────────────────────────────
+
+/**
+ * A discovered API pattern that the day-worker pool can replay
+ * to fetch multiple days' schedules concurrently.
+ */
+export interface DayApiPattern {
+  /** URL template with a `{{date}}` placeholder (e.g. "/api/schedule?date={{date}}"). */
+  urlTemplate: string;
+  method: 'GET' | 'POST';
+  /** The query/body parameter name that carries the date value. */
+  dateParam: string;
+  /** For POST requests, the JSON body template with `{{date}}` placeholder. */
+  bodyTemplate?: Record<string, unknown>;
+  /** Headers captured from the original request (includes auth tokens, etc.). */
+  headers: Record<string, string>;
+}
+
+// ─── Agent configuration ───────────────────────────────────
+
+/**
+ * Central configuration for all agent features.
+ * Read from environment variables with sensible defaults.
+ */
+export interface AgentConfig {
+  // Compliance
+  botUserAgent: string;
+  rateLimitMs: number;
+
+  // LLM
+  openaiApiKey?: string;
+  llmBudgetCents: number;
+
+  // Session
+  gymUsername?: string;
+  gymPassword?: string;
+  gymTotpSecret?: string;
+  cookieTtlHours: number;
+
+  // Trap detection
+  maxCrawlDepth: number;
+}
+
+/** Build an AgentConfig from process.env with defaults. */
+export function loadAgentConfig(): AgentConfig {
+  return {
+    botUserAgent:
+      process.env.BOT_USER_AGENT ??
+      'MilesC-GymBot/1.0 (+http://your-site.com/bot)',
+    rateLimitMs: parseInt(process.env.RATE_LIMIT_MS ?? '2000', 10),
+    openaiApiKey: process.env.OPENAI_API_KEY,
+    llmBudgetCents: parseInt(process.env.LLM_BUDGET_CENTS ?? '50', 10),
+    gymUsername: process.env.GYM_USERNAME,
+    gymPassword: process.env.GYM_PASSWORD,
+    gymTotpSecret: process.env.GYM_TOTP_SECRET,
+    cookieTtlHours: parseInt(process.env.COOKIE_TTL_HOURS ?? '24', 10),
+    maxCrawlDepth: parseInt(process.env.MAX_CRAWL_DEPTH ?? '5', 10),
+  };
+}

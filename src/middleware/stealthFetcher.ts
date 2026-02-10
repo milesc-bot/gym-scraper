@@ -1,68 +1,218 @@
 /**
- * stealthFetcher.ts — Browser-based HTTP fetch that minimises bot detection.
+ * stealthFetcher.ts — Intelligent fetch layer with light/browser fallback.
  *
- * WHY use a full browser instead of plain HTTP (axios / node-fetch)?
- * ─────────────────────────────────────────────────────────────────
- * 1. **JavaScript rendering:**  Most gym schedule widgets (MindBody, Glofox)
- *    load class data via XHR / React after the initial HTML.  A plain HTTP GET
- *    only returns the empty shell.
- * 2. **Anti-bot evasion:**  Cloudflare, Datadome, and similar services inspect
- *    TLS fingerprints, JS environment APIs, and behavioural signals.  Puppeteer
- *    with the stealth plugin patches all known detection vectors (navigator
- *    properties, WebGL vendor, chrome.runtime, etc.).
- * 3. **Cookie / session handling:**  Some gyms gate their schedule behind a
- *    consent click or region selector.  A real browser lets us interact with
- *    those flows if needed.
+ * FETCH STRATEGY
+ * ──────────────
+ * 1. **Compliance gate:**  Check robots.txt and rate-limit before fetching.
+ * 2. **Light path first:**  Try got-scraping (fast, TLS-impersonating HTTP).
+ * 3. **Content check:**  If the light response looks like an empty SPA shell
+ *    (no schedule-like tokens), fall back to full Puppeteer.
+ * 4. **Browser path:**  Full Puppeteer with stealth + fingerprint noise +
+ *    human idle behaviour.
+ * 5. **Status handling:**  402 → Pay-to-Crawl abort.  401/403 → auth wall flag.
  *
- * WHY delegate to BrowserManager instead of launching our own browser?
- * ───────────────────────────────────────────────────────────────────
- * BrowserManager owns the single Chromium process and provides short-lived
- * incognito contexts.  This means:
- *   • We never leak a browser process (the withPage try/finally handles it).
- *   • Startup cost is paid once, not per URL.
- *   • We don't have to think about cleanup here — BrowserManager does it.
+ * REFACTORED RETURN TYPE
+ * ──────────────────────
+ * This module now returns a `FetchResult` that includes the live Page and
+ * BrowserContext (when the browser path was used).  The caller is responsible
+ * for closing the context after validation.  This enables the extraction
+ * validator to inspect DOM state before cleanup.
  */
 
 import { BrowserManager } from '../core/browserManager';
 import { Logger } from '../core/logger';
+import { lightFetch } from './lightFetcher';
+import { isPaywallResponse, isAllowedByRobots, getRateLimiter, getBotUserAgent } from './compliance';
+import { createHumanCursor, randomIdle } from './humanBehavior';
+import { loadAgentConfig, type FetchResult } from '../core/types';
 
 const logger = new Logger('StealthFetcher');
 
 /**
- * Navigate to `url` inside a stealth-enabled browser and return the fully
- * rendered HTML.
+ * Fetch a URL with the full stealth pipeline.
  *
- * @param url - The target page to fetch (e.g. "https://gym.com/schedule").
- * @returns The full page HTML after JavaScript execution.
- *
- * WHY `waitUntil: 'networkidle2'`?
- * "networkidle2" waits until there are ≤ 2 in-flight network requests for
- * 500 ms.  This strikes a balance between:
- *   • `'domcontentloaded'` — too early; AJAX data hasn't arrived yet.
- *   • `'networkidle0'`     — too strict; analytics pixels and websockets
- *     may never fully settle, causing a 30-second timeout.
+ * @param url - The target page to fetch.
+ * @param options - Optional overrides.
+ * @returns A FetchResult.  If the browser path was used, `page` and `context`
+ *   are populated — the caller MUST close `context` when done.
  */
-export async function fetchWithStealth(url: string): Promise<string> {
-  logger.info(`Navigating to ${url}…`);
+export async function fetchWithStealth(
+  url: string,
+  options?: {
+    /** Force the browser path (skip light fetch). */
+    forceBrowser?: boolean;
+    /** Skip robots.txt check. */
+    skipRobots?: boolean;
+    /** Skip rate limiting. */
+    skipRateLimit?: boolean;
+  },
+): Promise<FetchResult> {
+  const config = loadAgentConfig();
 
-  const html = await BrowserManager.getInstance().withPage(async (page) => {
-    // WHY a 30-second timeout?
-    // Gym sites on shared hosting can be slow.  30 s is generous enough to
-    // survive a cold CDN cache miss without blocking the pipeline forever.
-    await page.goto(url, {
+  // ── Compliance gate ──────────────────────────────────────
+  if (!options?.skipRobots) {
+    const allowed = await isAllowedByRobots(url, config);
+    if (!allowed) {
+      logger.warn(`robots.txt disallows ${url} — skipping`);
+      return {
+        html: '',
+        statusCode: 0,
+        fetchMethod: 'light',
+      };
+    }
+  }
+
+  // Rate limiting — wait for our turn.
+  if (!options?.skipRateLimit) {
+    let hostname: string;
+    try {
+      hostname = new URL(url).hostname;
+    } catch {
+      hostname = 'unknown';
+    }
+    const limiter = getRateLimiter(hostname, config);
+    await limiter.schedule(() => Promise.resolve());
+  }
+
+  // ── Light fetch (try first unless forced to browser) ─────
+  if (!options?.forceBrowser) {
+    try {
+      logger.info(`Trying light fetch for ${url}…`);
+      const result = await lightFetch(url);
+
+      // Check for paywall.
+      if (isPaywallResponse(result.statusCode)) {
+        logger.warn(
+          `HTTP 402 Pay-to-Crawl firewall detected for ${url} — ` +
+            `this site requires a paid crawling agreement.  Skipping.`,
+        );
+        return {
+          html: '',
+          statusCode: 402,
+          fetchMethod: 'light',
+        };
+      }
+
+      // Check if the response has actual schedule content.
+      // If the HTML is mostly an SPA shell with no time-like tokens,
+      // the schedule is loaded via JS and we need the browser.
+      if (result.statusCode === 200 && looksLikeRenderedSchedule(result.body)) {
+        logger.info(`Light fetch returned rendered content — using it`);
+        return {
+          html: result.body,
+          statusCode: result.statusCode,
+          fetchMethod: 'light',
+        };
+      }
+
+      if (result.statusCode === 200) {
+        logger.info(
+          `Light fetch returned HTML but no schedule tokens — ` +
+            `falling back to browser for JS rendering`,
+        );
+      }
+    } catch (err) {
+      logger.warn(`Light fetch failed — falling back to browser: ${(err as Error).message}`);
+    }
+  }
+
+  // ── Browser fetch (full Puppeteer) ───────────────────────
+  logger.info(`Browser-fetching ${url}…`);
+
+  const manager = BrowserManager.getInstance();
+  const { page, context } = await manager.borrowPage();
+
+  try {
+    const response = await page.goto(url, {
       waitUntil: 'networkidle2',
       timeout: 30_000,
     });
 
-    // WHY wait an extra second?
-    // Some widgets (e.g. Glofox) fire a final render pass ~500 ms after
-    // networkidle.  A short sleep catches those without meaningfully slowing
-    // the overall run.
+    const statusCode = response?.status() ?? 0;
+
+    // Check for paywall on the browser path too.
+    if (isPaywallResponse(statusCode)) {
+      logger.warn(
+        `HTTP 402 Pay-to-Crawl firewall detected for ${url} — skipping`,
+      );
+      await context.close().catch(() => {});
+      return {
+        html: '',
+        statusCode: 402,
+        fetchMethod: 'browser',
+      };
+    }
+
+    // Extra wait for late-rendering widgets.
     await page.evaluate(() => new Promise((r) => setTimeout(r, 1_000)));
 
-    return page.content();
-  });
+    // Human idle behaviour — generate mouse/scroll telemetry.
+    try {
+      const cursor = createHumanCursor(page);
+      await randomIdle(page, cursor);
+    } catch {
+      // Idle simulation failed — non-fatal, page content is still valid.
+    }
 
-  logger.info(`Fetched page successfully — bypassed anti-bot check for ${url}`);
-  return html;
+    const html = await page.content();
+
+    logger.info(
+      `Browser fetch complete — HTTP ${statusCode} for ${url}`,
+    );
+
+    // Return page + context for the validator to inspect.
+    // The CALLER is responsible for closing the context.
+    return {
+      html,
+      statusCode,
+      page,
+      context,
+      fetchMethod: 'browser',
+    };
+  } catch (err) {
+    // On error, clean up and re-throw.
+    await context.close().catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Legacy wrapper that returns just the HTML string (backwards compatible).
+ *
+ * WHY keep this?
+ * Existing callers (and tests) that only need the HTML can use this
+ * simpler signature.  The context is auto-closed after extraction.
+ */
+export async function fetchHtml(url: string): Promise<string> {
+  const result = await fetchWithStealth(url);
+
+  // Auto-close the browser context if one was created.
+  if (result.context) {
+    await result.context.close().catch(() => {});
+  }
+
+  return result.html;
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+/**
+ * Quick heuristic: does this HTML look like it contains a rendered schedule?
+ *
+ * WHY not just check for any HTML?
+ * SPA shells (React, Vue) return valid HTML with a single `<div id="root">`
+ * and all content is loaded via JS.  We need to distinguish "HTML that
+ * already has schedule data" from "HTML that needs JS to render."
+ */
+function looksLikeRenderedSchedule(html: string): boolean {
+  // Look for time-like patterns (e.g. "6:00 PM", "18:00").
+  const timePattern = /\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm)/;
+  const dayPattern =
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+
+  const hasTime = timePattern.test(html);
+  const hasDay = dayPattern.test(html);
+
+  // If we see both a time and a day name, it's likely a rendered schedule.
+  return hasTime && hasDay;
 }
