@@ -1,0 +1,35 @@
+{
+  "name": "gym-scraper",
+  "version": "1.0.0",
+  "description": "Production-grade web scraping engine for extracting gym schedules, locations, and class data into Supabase.",
+  "main": "dist/gymScanner.js",
+  "types": "dist/gymScanner.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/gymScanner.js",
+    "dev": "ts-node src/gymScanner.ts",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "gym",
+    "scraper",
+    "puppeteer",
+    "supabase",
+    "schedule"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "cheerio": "^1.0.0",
+    "luxon": "^3.5.0",
+    "puppeteer": "^24.2.1",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.4.2",
+    "@types/node": "^22.13.1",
+    "typescript": "^5.7.3",
+    "ts-node": "^10.9.2"
+  }
+}
